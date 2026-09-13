@@ -5,12 +5,15 @@ import json
 import math
 import time
 import base64
+import queue
 import threading
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image
 
 from arduino.app_utils import App, Bridge
@@ -47,23 +50,6 @@ TREND_THRESHOLD_F = 1.0
 
 TEMP_ALERT_C = 35.0
 HUMIDITY_ALERT = 80.0
-
-# ============================================================
-# AQI CONFIGURATION
-# ============================================================
-
-CITY = "Brooklyn"
-API_TOKEN = "demo"
-AQI_ENDPOINT = f"https://api.waqi.info/feed/{CITY}/?token={API_TOKEN}"
-
-AQI_LEVELS = [
-    {"min": 0, "max": 50, "description": "Good"},
-    {"min": 51, "max": 100, "description": "Moderate"},
-    {"min": 101, "max": 150, "description": "Unhealthy for Sensitive Groups"},
-    {"min": 151, "max": 200, "description": "Unhealthy"},
-    {"min": 201, "max": 300, "description": "Very Unhealthy"},
-    {"min": 301, "max": 500, "description": "Hazardous"}
-]
 
 
 # ============================================================
@@ -103,7 +89,6 @@ os.makedirs(DATA_FOLDER, exist_ok=True)
 # ============================================================
 
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-
 CHAT_ID = "YOUR_CHAT_ID"
 
 
@@ -127,6 +112,28 @@ def telegram_url(method):
         f"bot{BOT_TOKEN}/"
         f"{method}"
     )
+
+
+# ============================================================
+# TELEGRAM SESSION (Connection Pooling + Retries)
+# ============================================================
+
+telegram_session = requests.Session()
+
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST", "GET"]
+)
+
+adapter = HTTPAdapter(
+    max_retries=retry_strategy,
+    pool_connections=5,
+    pool_maxsize=10
+)
+
+telegram_session.mount("https://", adapter)
 
 
 # ============================================================
@@ -169,7 +176,7 @@ dashboard_state = {
     "notifications_enabled": True,
 
     "last_sensor_update": None,
-    
+
     # Climate monitoring additions
     "aqi": None,
     "aqi_level": "Unknown",
@@ -625,92 +632,6 @@ def create_security_event(
 
 
 # ============================================================
-# AQI FUNCTIONS
-# ============================================================
-
-def map_aqi_level(aqi_value: int) -> str:
-    for level in AQI_LEVELS:
-        if level["min"] <= aqi_value <= level["max"]:
-            return level["description"]
-    return "Unknown"
-
-
-def get_air_quality():
-    try:
-        response = requests.get(AQI_ENDPOINT, timeout=10)
-        response.raise_for_status()
-        response_json = response.json()
-        status = response_json.get("status")
-        data = response_json.get("data")
-        
-        if status != "ok" or not data:
-            print("AQI API Error:", response_json)
-            return "Unknown"
-        
-        aqi = data.get("aqi", -1)
-        if aqi == "-" or aqi is None:
-            print("AQI value unavailable.")
-            return "Unknown"
-        
-        try:
-            aqi = int(aqi)
-        except (ValueError, TypeError):
-            print("Invalid AQI value:", aqi)
-            return "Unknown"
-        
-        aqi_level = map_aqi_level(aqi)
-        
-        with state_lock:
-            dashboard_state["aqi"] = aqi
-            dashboard_state["aqi_level"] = aqi_level
-        
-        print(f"Outdoor AQI: {aqi} ({aqi_level})")
-        
-        ui.send_message("air_quality", {
-            "aqi": aqi,
-            "level": aqi_level,
-            "ts": int(time.time() * 1000)
-        })
-        
-        return aqi_level
-        
-    except Exception as e:
-        print(f"AQI request failed: {e}")
-        return "Unknown"
-
-
-# ============================================================
-# WEATHER FUNCTIONS
-# ============================================================
-
-forecaster = WeatherForecast()
-
-
-def get_weather_forecast(city: str):
-    try:
-        forecast = forecaster.get_forecast_by_city(city)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        with state_lock:
-            dashboard_state["weather"] = forecast.category
-            dashboard_state["weather_description"] = forecast.description
-        
-        print(f"[{now}] Weather for {city}: {forecast.description} -> {forecast.category}")
-        
-        ui.send_message("weather", {
-            "category": forecast.category,
-            "description": forecast.description,
-            "ts": int(time.time() * 1000)
-        })
-        
-        return forecast.category
-        
-    except Exception as e:
-        print(f"Weather request failed: {e}")
-        return "unknown"
-
-
-# ============================================================
 # HEAT INDEX
 # ============================================================
 
@@ -944,244 +865,148 @@ def update_environment_state(
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# TELEGRAM MESSAGE QUEUE (Non-blocking)
 # ============================================================
 
-def send_telegram_message(
-    chat_id,
-    text
-):
+telegram_queue = queue.Queue()
+
+telegram_sender_running = True
+
+
+def telegram_sender_worker():
+    """Background worker that sends Telegram messages without blocking."""
+
+    log("📨 Telegram sender thread started")
+
+    while telegram_sender_running:
+
+        try:
+
+            item = telegram_queue.get(timeout=1)
+
+            if item is None:
+                break
+
+            chat_id, text, photo_path = item
+
+            try:
+
+                if photo_path:
+
+                    # Send photo
+                    with open(photo_path, "rb") as photo:
+
+                        response = telegram_session.post(
+
+                            telegram_url("sendPhoto"),
+
+                            data={
+                                "chat_id": chat_id,
+                                "caption": text
+                            },
+
+                            files={"photo": photo},
+
+                            timeout=15
+                        )
+
+                else:
+
+                    # Send text message
+                    response = telegram_session.post(
+
+                        telegram_url("sendMessage"),
+
+                        data={
+                            "chat_id": chat_id,
+                            "text": text
+                        },
+
+                        timeout=10
+                    )
+
+                if response.ok:
+
+                    log(
+                        f"✅ Telegram message sent "
+                        f"(queue: {telegram_queue.qsize()})"
+                    )
+
+                else:
+
+                    log(
+                        f"⚠️ Telegram send failed: "
+                        f"{response.text[:200]}"
+                    )
+
+            except Exception as exc:
+
+                log(f"Telegram send error: {exc}")
+
+            telegram_queue.task_done()
+
+        except queue.Empty:
+
+            continue
+
+        except Exception as exc:
+
+            log(f"Telegram worker error: {exc}")
+
+    log("📨 Telegram sender thread stopped")
+
+
+# Start worker thread
+telegram_worker_thread = threading.Thread(
+    target=telegram_sender_worker,
+    daemon=True,
+    name="TelegramSender"
+)
+
+telegram_worker_thread.start()
+
+
+# ============================================================
+# TELEGRAM SENDERS (Non-blocking)
+# ============================================================
+
+def send_telegram_message(chat_id, text):
+    """Queue a text message for sending (non-blocking, ~1ms)."""
 
     if not telegram_configured():
 
-        log(
-            "Telegram not configured; "
-            "message skipped."
-        )
+        log("Telegram not configured; message skipped.")
 
         return False
 
-    try:
+    telegram_queue.put((chat_id, text, None))
 
-        response = requests.post(
+    log(f"📤 Queued Telegram message (queue: {telegram_queue.qsize()})")
 
-            telegram_url(
-                "sendMessage"
-            ),
-
-            data={
-                "chat_id":
-                    chat_id,
-
-                "text":
-                    text
-            },
-
-            timeout=10
-        )
-
-        if response.ok:
-
-            return True
-
-        log(
-            "Telegram send error: "
-            + response.text
-        )
-
-    except Exception as exc:
-
-        log(
-            f"Telegram send error: {exc}"
-        )
-
-    return False
+    return True
 
 
-# ============================================================
-# TELEGRAM PHOTO
-# ============================================================
-
-def send_telegram_photo(
-    filename,
-    confidence
-):
+def send_telegram_photo(filename, confidence):
+    """Queue a photo for sending (non-blocking, ~1ms)."""
 
     if not telegram_configured():
 
-        log(
-            "Telegram not configured; "
-            "photo skipped."
-        )
+        log("Telegram not configured; photo skipped.")
 
         return False
 
-    try:
+    caption = (
+        f"🚨 SECURITY CAMERA ALERT\n\n"
+        f"🚨 STRANGER DETECTED\n\n"
+        f"Confidence: {confidence * 100:.2f}%\n"
+        f"Time: {readable_time()}"
+    )
 
-        caption = (
+    telegram_queue.put((CHAT_ID, caption, filename))
 
-            "🚨 SECURITY CAMERA ALERT\n\n"
+    log(f"📤 Queued Telegram photo (queue: {telegram_queue.qsize()})")
 
-            "🚨 STRANGER DETECTED\n\n"
-
-            f"Confidence: "
-            f"{confidence * 100:.2f}%\n"
-
-            f"Time: "
-            f"{readable_time()}"
-        )
-
-        with open(
-            filename,
-            "rb"
-        ) as photo:
-
-            response = requests.post(
-
-                telegram_url(
-                    "sendPhoto"
-                ),
-
-                data={
-                    "chat_id":
-                        CHAT_ID,
-
-                    "caption":
-                        caption
-                },
-
-                files={
-                    "photo":
-                        photo
-                },
-
-                timeout=20
-            )
-
-        if response.ok:
-
-            data = response.json()
-
-            if data.get(
-                "ok",
-                False
-            ):
-
-                log(
-                    "✅ Telegram stranger photo sent."
-                )
-
-                return True
-
-        log(
-            "Telegram photo error: "
-            + response.text
-        )
-
-    except Exception as exc:
-
-        log(
-            f"Telegram photo error: {exc}"
-        )
-
-    return False
-
-
-# ============================================================
-# RECORD SENSOR SAMPLES (for climate dashboard)
-# ============================================================
-
-def record_sensor_samples(celsius, humidity):
-    """Legacy function for climate monitoring system"""
-    try:
-        T = float(celsius)
-        RH = float(humidity)
-    except (ValueError, TypeError):
-        print("Unable to convert sensor values:", celsius, humidity)
-        return
-    
-    if math.isnan(T) or math.isnan(RH):
-        print("NaN sensor samples:", T, RH)
-        return
-    
-    RH = max(0.0, min(RH, 100.0))
-    ts = int(datetime.now().timestamp() * 1000)
-    
-    # Temperature in Fahrenheit
-    fahrenheit = (T * 9.0 / 5.0) + 32.0
-    
-    # Database
-    db.write_sample("temperature", fahrenheit, ts)
-    db.write_sample("humidity", RH, ts)
-    
-    # Realtime dashboard
-    ui.send_message("temperature", {"value": fahrenheit, "ts": ts})
-    ui.send_message("humidity", {"value": RH, "ts": ts})
-    
-    # Dew Point
-    dew_point_f = None
-    if RH > 0.0:
-        a = 17.27
-        b = 237.7
-        rh_frac = max(min(RH, 100.0), 1e-6)
-        gamma = ((a * T) / (b + T)) + math.log(rh_frac / 100.0)
-        denominator = (a - gamma)
-        if denominator != 0:
-            dew_point_c = (b * gamma) / denominator
-            dew_point_f = (dew_point_c * 9.0 / 5.0) + 32.0
-    
-    if dew_point_f is not None:
-        db.write_sample("dew_point", dew_point_f, ts)
-        ui.send_message("dew_point", {"value": dew_point_f, "ts": ts})
-    
-    # Heat Index
-    T_f = fahrenheit
-    R = max(min(RH, 100.0), 0.0)
-    
-    if T_f < 80.0:
-        heat_index_f = T_f
-    else:
-        heat_index_f = (-42.379 + 2.04901523 * T_f + 10.14333127 * R -
-                        0.22475541 * T_f * R - 0.00683783 * T_f * T_f -
-                        0.05481717 * R * R + 0.00122874 * T_f * T_f * R +
-                        0.00085282 * T_f * R * R - 0.00000199 * T_f * T_f * R * R)
-    
-    db.write_sample("heat_index", heat_index_f, ts)
-    ui.send_message("heat_index", {"value": heat_index_f, "ts": ts})
-    
-    # Absolute Humidity
-    absolute_humidity = None
-    denominator = 273.15 + T
-    if RH >= 0.0 and denominator != 0:
-        es = 6.112 * math.exp((17.67 * T) / (T + 243.5))
-        absolute_humidity = es * (R / 100.0) * 2.1674 / denominator
-    
-    if absolute_humidity is not None:
-        db.write_sample("absolute_humidity", float(absolute_humidity), ts)
-        ui.send_message("absolute_humidity", {"value": float(absolute_humidity), "ts": ts})
-    
-    # Combined climate status
-    ui.send_message("climate_status", {
-        "temperature": fahrenheit,
-        "humidity": RH,
-        "dew_point": dew_point_f,
-        "heat_index": heat_index_f,
-        "absolute_humidity": absolute_humidity,
-        "ts": ts
-    })
-    
-    print(f"Indoor Temperature: {fahrenheit:.1f} °F")
-    print(f"Indoor Humidity: {RH:.1f} %")
-    if dew_point_f is not None:
-        print(f"Dew Point: {dew_point_f:.1f} °F")
-    print(f"Heat Index: {heat_index_f:.1f} °F")
-    if absolute_humidity is not None:
-        print(f"Absolute Humidity: {absolute_humidity:.2f} g/m³")
-    print()
-    
-    # Periodic outdoor update
-    get_air_quality()
-    get_weather_forecast(CITY)
+    return True
 
 
 # ============================================================
@@ -1358,6 +1183,248 @@ def on_environment(
 
 
 # ============================================================
+# RECORD SENSOR SAMPLES (for climate dashboard)
+# ============================================================
+
+def record_sensor_samples(celsius, humidity):
+    """Legacy function for climate monitoring system"""
+
+    try:
+
+        T = float(celsius)
+
+        RH = float(humidity)
+
+    except (ValueError, TypeError):
+
+        print("Unable to convert sensor values:", celsius, humidity)
+
+        return
+
+    if math.isnan(T) or math.isnan(RH):
+
+        print("NaN sensor samples:", T, RH)
+
+        return
+
+    RH = max(0.0, min(RH, 100.0))
+
+    ts = int(datetime.now().timestamp() * 1000)
+
+    # Temperature in Fahrenheit
+    fahrenheit = (T * 9.0 / 5.0) + 32.0
+
+    # Database
+    db.write_sample("temperature", fahrenheit, ts)
+
+    db.write_sample("humidity", RH, ts)
+
+    # Realtime dashboard
+    ui.send_message("temperature", {"value": fahrenheit, "ts": ts})
+
+    ui.send_message("humidity", {"value": RH, "ts": ts})
+
+    # Dew Point
+    dew_point_f = None
+
+    if RH > 0.0:
+
+        a = 17.27
+
+        b = 237.7
+
+        rh_frac = max(min(RH, 100.0), 1e-6)
+
+        gamma = ((a * T) / (b + T)) + math.log(rh_frac / 100.0)
+
+        denominator = (a - gamma)
+
+        if denominator != 0:
+
+            dew_point_c = (b * gamma) / denominator
+
+            dew_point_f = (dew_point_c * 9.0 / 5.0) + 32.0
+
+    if dew_point_f is not None:
+
+        db.write_sample("dew_point", dew_point_f, ts)
+
+        ui.send_message("dew_point", {"value": dew_point_f, "ts": ts})
+
+    # Heat Index
+    T_f = fahrenheit
+
+    R = max(min(RH, 100.0), 0.0)
+
+    if T_f < 80.0:
+
+        heat_index_f = T_f
+
+    else:
+
+        heat_index_f = (
+            -42.379 + 2.04901523 * T_f + 10.14333127 * R -
+            0.22475541 * T_f * R - 0.00683783 * T_f * T_f -
+            0.05481717 * R * R + 0.00122874 * T_f * T_f * R +
+            0.00085282 * T_f * R * R - 0.00000199 * T_f * T_f * R * R
+        )
+
+    db.write_sample("heat_index", heat_index_f, ts)
+
+    ui.send_message("heat_index", {"value": heat_index_f, "ts": ts})
+
+    # Absolute Humidity
+    absolute_humidity = None
+
+    denominator = 273.15 + T
+
+    if RH >= 0.0 and denominator != 0:
+
+        es = 6.112 * math.exp((17.67 * T) / (T + 243.5))
+
+        absolute_humidity = es * (R / 100.0) * 2.1674 / denominator
+
+    if absolute_humidity is not None:
+
+        db.write_sample("absolute_humidity", float(absolute_humidity), ts)
+
+        ui.send_message("absolute_humidity", {"value": float(absolute_humidity), "ts": ts})
+
+    # Combined climate status
+    ui.send_message("climate_status", {
+        "temperature": fahrenheit,
+        "humidity": RH,
+        "dew_point": dew_point_f,
+        "heat_index": heat_index_f,
+        "absolute_humidity": absolute_humidity,
+        "ts": ts
+    })
+
+    print(f"Indoor Temperature: {fahrenheit:.1f} °F")
+
+    print(f"Indoor Humidity: {RH:.1f} %")
+
+    if dew_point_f is not None:
+
+        print(f"Dew Point: {dew_point_f:.1f} °F")
+
+    print(f"Heat Index: {heat_index_f:.1f} °F")
+
+    if absolute_humidity is not None:
+
+        print(f"Absolute Humidity: {absolute_humidity:.2f} g/m³")
+
+    print()
+
+    # Periodic outdoor update
+    get_air_quality()
+
+    get_weather_forecast(CITY)
+
+
+# ============================================================
+# AQI FUNCTIONS
+# ============================================================
+
+CITY = "Brooklyn"
+
+API_TOKEN = "demo"
+
+AQI_ENDPOINT = f"https://api.waqi.info/feed/{CITY}/?token={API_TOKEN}"
+
+AQI_LEVELS = [
+    {"min": 0, "max": 50, "description": "Good"},
+    {"min": 51, "max": 100, "description": "Moderate"},
+    {"min": 101, "max": 150, "description": "Unhealthy for Sensitive Groups"},
+    {"min": 151, "max": 200, "description": "Unhealthy"},
+    {"min": 201, "max": 300, "description": "Very Unhealthy"},
+    {"min": 301, "max": 500, "description": "Hazardous"}
+]
+
+
+def map_aqi_level(aqi_value: int) -> str:
+    for level in AQI_LEVELS:
+        if level["min"] <= aqi_value <= level["max"]:
+            return level["description"]
+    return "Unknown"
+
+
+def get_air_quality():
+    try:
+        response = requests.get(AQI_ENDPOINT, timeout=10)
+        response.raise_for_status()
+        response_json = response.json()
+        status = response_json.get("status")
+        data = response_json.get("data")
+        
+        if status != "ok" or not data:
+            print("AQI API Error:", response_json)
+            return "Unknown"
+        
+        aqi = data.get("aqi", -1)
+        if aqi == "-" or aqi is None:
+            print("AQI value unavailable.")
+            return "Unknown"
+        
+        try:
+            aqi = int(aqi)
+        except (ValueError, TypeError):
+            print("Invalid AQI value:", aqi)
+            return "Unknown"
+        
+        aqi_level = map_aqi_level(aqi)
+        
+        with state_lock:
+            dashboard_state["aqi"] = aqi
+            dashboard_state["aqi_level"] = aqi_level
+        
+        print(f"Outdoor AQI: {aqi} ({aqi_level})")
+        
+        ui.send_message("air_quality", {
+            "aqi": aqi,
+            "level": aqi_level,
+            "ts": int(time.time() * 1000)
+        })
+        
+        return aqi_level
+        
+    except Exception as e:
+        print(f"AQI request failed: {e}")
+        return "Unknown"
+
+
+# ============================================================
+# WEATHER FUNCTIONS
+# ============================================================
+
+forecaster = WeatherForecast()
+
+
+def get_weather_forecast(city: str):
+    try:
+        forecast = forecaster.get_forecast_by_city(city)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with state_lock:
+            dashboard_state["weather"] = forecast.category
+            dashboard_state["weather_description"] = forecast.description
+        
+        print(f"[{now}] Weather for {city}: {forecast.description} -> {forecast.category}")
+        
+        ui.send_message("weather", {
+            "category": forecast.category,
+            "description": forecast.description,
+            "ts": int(time.time() * 1000)
+        })
+        
+        return forecast.category
+        
+    except Exception as e:
+        print(f"Weather request failed: {e}")
+        return "unknown"
+
+
+# ============================================================
 # MOTION NOTIFICATION
 # ============================================================
 
@@ -1386,16 +1453,15 @@ def send_motion_notification():
 # DOOR NOTIFICATION
 # ============================================================
 
-def send_door_notification(
-    event
-):
+def send_door_notification(event):
 
     if event == "opened":
 
         message = (
             "🚪 DOOR OPENED!\n\n"
             "Door sensor detected an "
-            "open door."
+            "open door.\n"
+            "🔔 Buzzer may be active if armed."
         )
 
     elif event == "closed":
@@ -1429,9 +1495,7 @@ def on_pir(value):
 
     try:
 
-        active = (
-            int(value) == 1
-        )
+        active = (int(value) == 1)
 
         previous = pir_active
 
@@ -1439,9 +1503,7 @@ def on_pir(value):
 
         with state_lock:
 
-            dashboard_state[
-                "pir_active"
-            ] = active
+            dashboard_state["pir_active"] = active
 
         # ----------------------------------------------------
         # INITIAL STATE
@@ -1453,24 +1515,12 @@ def on_pir(value):
 
             log(
                 "PIR initial state: "
-                +
-                (
-                    "MOTION"
-                    if active
-                    else
-                    "IDLE"
-                )
+                + ("MOTION" if active else "IDLE")
             )
 
             try:
 
-                ui.send_message(
-                    "pir_state",
-                    {
-                        "active":
-                            active
-                    }
-                )
+                ui.send_message("pir_state", {"active": active})
 
             except Exception:
                 pass
@@ -1485,18 +1535,11 @@ def on_pir(value):
 
             classification_completed_for_motion = False
 
-            log(
-                "🚨 PIR MOTION DETECTED"
-            )
+            log("🚨 PIR MOTION DETECTED")
 
             try:
 
-                ui.send_message(
-                    "pir_state",
-                    {
-                        "active": True
-                    }
-                )
+                ui.send_message("pir_state", {"active": True})
 
             except Exception:
                 pass
@@ -1509,20 +1552,11 @@ def on_pir(value):
 
             now = time.time()
 
-            if (
-                now -
-                last_motion_notification_time
-                >=
-                MOTION_COOLDOWN
-            ):
+            if (now - last_motion_notification_time >= MOTION_COOLDOWN):
 
                 with state_lock:
 
-                    notifications_enabled = (
-                        dashboard_state[
-                            "notifications_enabled"
-                        ]
-                    )
+                    notifications_enabled = dashboard_state["notifications_enabled"]
 
                 if notifications_enabled:
 
@@ -1534,33 +1568,20 @@ def on_pir(value):
         # MOTION END
         # ----------------------------------------------------
 
-        elif (
-            not active
-            and
-            previous
-        ):
+        elif (not active and previous):
 
-            log(
-                "⏳ PIR motion ended."
-            )
+            log("⏳ PIR motion ended.")
 
             try:
 
-                ui.send_message(
-                    "pir_state",
-                    {
-                        "active": False
-                    }
-                )
+                ui.send_message("pir_state", {"active": False})
 
             except Exception:
                 pass
 
     except Exception as exc:
 
-        log(
-            f"PIR callback error: {exc}"
-        )
+        log(f"PIR callback error: {exc}")
 
 
 # ============================================================
@@ -1577,13 +1598,9 @@ def on_door(is_open):
 
         with state_lock:
 
-            previous = dashboard_state[
-                "door_open"
-            ]
+            previous = dashboard_state["door_open"]
 
-            dashboard_state[
-                "door_open"
-            ] = is_open
+            dashboard_state["door_open"] = is_open
 
         # ----------------------------------------------------
         # INITIAL STATE
@@ -1595,24 +1612,12 @@ def on_door(is_open):
 
             log(
                 "Door initial state: "
-                +
-                (
-                    "OPEN"
-                    if is_open
-                    else
-                    "CLOSED"
-                )
+                + ("OPEN" if is_open else "CLOSED")
             )
 
             try:
 
-                ui.send_message(
-                    "door_state",
-                    {
-                        "open":
-                            is_open
-                    }
-                )
+                ui.send_message("door_state", {"open": is_open})
 
             except Exception:
                 pass
@@ -1631,26 +1636,11 @@ def on_door(is_open):
         # STATE CHANGED
         # ----------------------------------------------------
 
-        log(
-            "🚪 DOOR: "
-            +
-            (
-                "OPEN"
-                if is_open
-                else
-                "CLOSED"
-            )
-        )
+        log("🚪 DOOR: " + ("OPEN" if is_open else "CLOSED"))
 
         try:
 
-            ui.send_message(
-                "door_state",
-                {
-                    "open":
-                        is_open
-                }
-            )
+            ui.send_message("door_state", {"open": is_open})
 
         except Exception:
             pass
@@ -1663,9 +1653,7 @@ def on_door(is_open):
                 "warning"
             )
 
-            send_door_notification(
-                "opened"
-            )
+            send_door_notification("opened")
 
         else:
 
@@ -1675,15 +1663,11 @@ def on_door(is_open):
                 "info"
             )
 
-            send_door_notification(
-                "closed"
-            )
+            send_door_notification("closed")
 
     except Exception as exc:
 
-        log(
-            f"Door callback error: {exc}"
-        )
+        log(f"Door callback error: {exc}")
 
 
 # ============================================================
@@ -1694,29 +1678,23 @@ def send_hourly_report():
 
     if not hourly_temperature_readings:
 
-        log(
-            "No readings available "
-            "for hourly report."
-        )
+        log("No readings available for hourly report.")
 
         return
 
     average_temperature = (
         sum(hourly_temperature_readings)
-        /
-        len(hourly_temperature_readings)
+        / len(hourly_temperature_readings)
     )
 
     average_humidity = (
         sum(hourly_humidity_readings)
-        /
-        len(hourly_humidity_readings)
+        / len(hourly_humidity_readings)
     )
 
     average_heat_index = (
         sum(hourly_heat_index_readings)
-        /
-        len(hourly_heat_index_readings)
+        / len(hourly_heat_index_readings)
     )
 
     trend = calculate_trend()
@@ -1751,10 +1729,7 @@ def send_hourly_report():
         flush=True
     )
 
-    send_telegram_message(
-        CHAT_ID,
-        report
-    )
+    send_telegram_message(CHAT_ID, report)
 
     hourly_temperature_readings.clear()
 
@@ -1767,26 +1742,18 @@ def send_hourly_report():
 # FACE DETECTION METADATA
 # ============================================================
 
-def receive_detection_data(
-    detections
-):
+def receive_detection_data(detections):
 
     global latest_face_box
     global latest_face_confidence
 
     try:
 
-        if not isinstance(
-            detections,
-            dict
-        ):
+        if not isinstance(detections, dict):
 
             return
 
-        faces = detections.get(
-            "face",
-            []
-        )
+        faces = detections.get("face", [])
 
         if not faces:
 
@@ -1794,23 +1761,13 @@ def receive_detection_data(
 
         face = faces[0]
 
-        if not isinstance(
-            face,
-            dict
-        ):
+        if not isinstance(face, dict):
 
             return
 
-        box = face.get(
-            "bounding_box_xyxy"
-        )
+        box = face.get("bounding_box_xyxy")
 
-        confidence = float(
-            face.get(
-                "confidence",
-                0
-            )
-        )
+        confidence = float(face.get("confidence", 0))
 
         if box is None:
 
@@ -1818,20 +1775,13 @@ def receive_detection_data(
 
         with face_data_lock:
 
-            latest_face_box = tuple(
-                int(v)
-                for v in box
-            )
+            latest_face_box = tuple(int(v) for v in box)
 
-            latest_face_confidence = (
-                confidence
-            )
+            latest_face_confidence = confidence
 
     except Exception as exc:
 
-        log(
-            f"Face metadata error: {exc}"
-        )
+        log(f"Face metadata error: {exc}")
 
 
 # ============================================================
@@ -1848,31 +1798,21 @@ def face_detected():
 
     with state_lock:
 
-        armed = dashboard_state[
-            "system_armed"
-        ]
+        armed = dashboard_state["system_armed"]
 
     if not armed:
 
         return
 
-    if (
-        ONE_RESULT_PER_MOTION
-        and
-        classification_completed_for_motion
-    ):
+    if (ONE_RESULT_PER_MOTION and classification_completed_for_motion):
 
         return
 
     classification_completed_for_motion = True
 
-    log(
-        "👤 FACE DETECTED"
-    )
+    log("👤 FACE DETECTED")
 
-    log(
-        "➡️ Classifying face..."
-    )
+    log("➡️ Classifying face...")
 
     threading.Thread(
         target=classify_and_process,
@@ -1884,17 +1824,11 @@ def face_detected():
 # SAVE STRANGER FACE
 # ============================================================
 
-def save_stranger_face(
-    image,
-    box,
-    confidence
-):
+def save_stranger_face(image, box, confidence):
 
     if box is None:
 
-        log(
-            "⚠️ No face bounding box."
-        )
+        log("⚠️ No face bounding box.")
 
         return None
 
@@ -1906,89 +1840,38 @@ def save_stranger_face(
 
         face_height = y2 - y1
 
-        pad_x = int(
-            face_width *
-            FACE_PADDING_X
-        )
+        pad_x = int(face_width * FACE_PADDING_X)
 
-        pad_y = int(
-            face_height *
-            FACE_PADDING_Y
-        )
+        pad_y = int(face_height * FACE_PADDING_Y)
 
         crop_box = (
-
-            max(
-                0,
-                x1 - pad_x
-            ),
-
-            max(
-                0,
-                y1 - pad_y
-            ),
-
-            min(
-                image.width,
-                x2 + pad_x
-            ),
-
-            min(
-                image.height,
-                y2 + pad_y
-            )
+            max(0, x1 - pad_x),
+            max(0, y1 - pad_y),
+            min(image.width, x2 + pad_x),
+            min(image.height, y2 + pad_y)
         )
 
-        face_image = image.crop(
-            crop_box
-        )
+        face_image = image.crop(crop_box)
 
         filename = (
-
             "stranger_"
-
-            +
-            local_now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-
-            +
-            "_"
-
-            +
-            str(
-                int(
-                    confidence * 100
-                )
-            )
-
-            +
-            ".jpg"
+            + local_now().strftime("%Y%m%d_%H%M%S")
+            + "_"
+            + str(int(confidence * 100))
+            + ".jpg"
         )
 
-        filepath = os.path.join(
-            SNAPSHOT_FOLDER,
-            filename
-        )
+        filepath = os.path.join(SNAPSHOT_FOLDER, filename)
 
-        face_image.save(
-            filepath,
-            "JPEG",
-            quality=95
-        )
+        face_image.save(filepath, "JPEG", quality=95)
 
-        log(
-            "📸 Stranger snapshot saved: "
-            f"{filepath}"
-        )
+        log(f"📸 Stranger snapshot saved: {filepath}")
 
         return filepath
 
     except Exception as exc:
 
-        log(
-            f"❌ Snapshot error: {exc}"
-        )
+        log(f"❌ Snapshot error: {exc}")
 
         return None
 
@@ -2006,9 +1889,7 @@ def classify_and_process():
 
         if classification_running:
 
-            log(
-                "Classification already running."
-            )
+            log("Classification already running.")
 
             return
 
@@ -2018,100 +1899,63 @@ def classify_and_process():
 
         now = time.monotonic()
 
-        if (
-            now -
-            last_classification_time
-            <
-            CLASSIFICATION_COOLDOWN
-        ):
+        if (now - last_classification_time < CLASSIFICATION_COOLDOWN):
 
-            log(
-                "Classification cooldown."
-            )
+            log("Classification cooldown.")
 
             return
 
         last_classification_time = now
 
-        log(
-            "📷 Capturing image..."
-        )
+        log("📷 Capturing image...")
 
         frame = camera.capture()
 
         if frame is None:
 
-            log(
-                "❌ Camera returned no frame."
-            )
+            log("❌ Camera returned no frame.")
 
             return
 
-        image = convert_to_pil(
-            frame
-        )
+        image = convert_to_pil(frame)
 
         if image is None:
 
-            log(
-                "❌ Unable to convert camera frame."
-            )
+            log("❌ Unable to convert camera frame.")
 
             return
 
-        log(
-            f"✅ Captured "
-            f"{image.width}x{image.height}"
-        )
+        log(f"✅ Captured {image.width}x{image.height}")
 
         with face_data_lock:
 
             face_box = latest_face_box
 
-            face_confidence = (
-                latest_face_confidence
-            )
+            face_confidence = latest_face_confidence
 
-        log(
-            f"Face box: {face_box}"
-        )
+        log(f"Face box: {face_box}")
 
-        log(
-            f"Face confidence: "
-            f"{face_confidence:.2f}"
-        )
+        log(f"Face confidence: {face_confidence:.2f}")
 
-        log(
-            "🧠 Running "
-            "Family/Stranger classification..."
-        )
+        log("🧠 Running Family/Stranger classification...")
 
-        results = (
-            image_classification.classify(
-                image,
-                image_type="jpeg",
-                confidence=0.0
-            )
+        results = image_classification.classify(
+            image,
+            image_type="jpeg",
+            confidence=0.0
         )
 
         if not results:
 
-            log(
-                "❌ Classification returned no result."
-            )
+            log("❌ Classification returned no result.")
 
             return
 
-        classifications = results.get(
-            "classification",
-            []
-        )
+        classifications = results.get("classification", [])
 
         if not classifications:
 
-            log(
-                "⚠️ No classification entries."
-            )
+            log("⚠️ No classification entries.")
 
             return
 
@@ -2121,28 +1965,15 @@ def classify_and_process():
 
         for item in classifications:
 
-            class_name = str(
-                item.get(
-                    "class_name",
-                    ""
-                )
-            ).lower().strip()
+            class_name = str(item.get("class_name", "")).lower().strip()
 
-            confidence = float(
-                item.get(
-                    "confidence",
-                    0
-                )
-            )
+            confidence = float(item.get("confidence", 0))
 
             if confidence > 1.0:
 
                 confidence /= 100.0
 
-            log(
-                f"{class_name}: "
-                f"{confidence * 100:.2f}%"
-            )
+            log(f"{class_name}: {confidence * 100:.2f}%")
 
             if class_name == "family":
 
@@ -2156,30 +1987,16 @@ def classify_and_process():
         # FAMILY
         # ====================================================
 
-        if (
-            family_confidence
-            >=
-            CLASSIFICATION_THRESHOLD
-            and
-            family_confidence
-            >
-            stranger_confidence
-        ):
+        if (family_confidence >= CLASSIFICATION_THRESHOLD
+                and family_confidence > stranger_confidence):
 
-            log(
-                "🟢 FAMILY MEMBER"
-            )
+            log("🟢 FAMILY MEMBER")
 
             create_security_event(
-
                 "Family Member",
-
                 "Family member detected.",
-
                 "info",
-
                 image,
-
                 family_confidence
             )
 
@@ -2187,45 +2004,24 @@ def classify_and_process():
         # STRANGER
         # ====================================================
 
-        elif (
-            stranger_confidence
-            >=
-            CLASSIFICATION_THRESHOLD
-            and
-            stranger_confidence
-            >
-            family_confidence
-        ):
+        elif (stranger_confidence >= CLASSIFICATION_THRESHOLD
+                and stranger_confidence > family_confidence):
 
-            log(
-                "🚨 STRANGER DETECTED"
-            )
+            log("🚨 STRANGER DETECTED")
 
-            snapshot = save_stranger_face(
-                image,
-                face_box,
-                stranger_confidence
-            )
+            snapshot = save_stranger_face(image, face_box, stranger_confidence)
 
             create_security_event(
-
                 "Stranger Detected",
-
                 "Unknown person detected.",
-
                 "critical",
-
                 image,
-
                 stranger_confidence
             )
 
             if snapshot:
 
-                send_telegram_photo(
-                    snapshot,
-                    stranger_confidence
-                )
+                send_telegram_photo(snapshot, stranger_confidence)
 
         # ====================================================
         # UNCERTAIN
@@ -2233,37 +2029,21 @@ def classify_and_process():
 
         else:
 
-            confidence = max(
-                family_confidence,
-                stranger_confidence
-            )
+            confidence = max(family_confidence, stranger_confidence)
 
-            log(
-                "⚠️ CLASSIFICATION UNCERTAIN"
-            )
+            log("⚠️ CLASSIFICATION UNCERTAIN")
 
             create_security_event(
-
                 "Uncertain",
-
-                (
-                    "Face detected, but "
-                    "classification confidence "
-                    "was below threshold."
-                ),
-
+                "Face detected, but classification confidence was below threshold.",
                 "warning",
-
                 image,
-
                 confidence
             )
 
     except Exception as exc:
 
-        log(
-            f"❌ CLASSIFICATION ERROR: {exc}"
-        )
+        log(f"❌ CLASSIFICATION ERROR: {exc}")
 
     finally:
 
@@ -2278,19 +2058,13 @@ def send_dashboard_state():
 
     with state_lock:
 
-        current_state = dict(
-            dashboard_state
-        )
+        current_state = dict(dashboard_state)
 
     with events_lock:
 
-        current_events = list(
-            events[-MAX_EVENTS:]
-        )
+        current_events = list(events[-MAX_EVENTS:])
 
-    current_history = (
-        load_sensor_history()
-    )
+    current_history = load_sensor_history()
 
     try:
 
@@ -2299,43 +2073,28 @@ def send_dashboard_state():
             "sync",
 
             {
-                "state":
-                    current_state,
-
-                "events":
-                    current_events,
-
-                "history":
-                    current_history
+                "state": current_state,
+                "events": current_events,
+                "history": current_history
             }
         )
 
     except Exception as exc:
 
-        log(
-            f"Dashboard sync error: {exc}"
-        )
+        log(f"Dashboard sync error: {exc}")
 
 
 # ============================================================
 # WEBUI CONTROL
 # ============================================================
 
-def handle_control(
-    client_id,
-    data
-):
+def handle_control(client_id, data):
 
-    if not isinstance(
-        data,
-        dict
-    ):
+    if not isinstance(data, dict):
 
         return
 
-    action = data.get(
-        "action"
-    )
+    action = data.get("action")
 
     # --------------------------------------------------------
     # Browser startup
@@ -2353,29 +2112,31 @@ def handle_control(
 
     if action == "set_armed":
 
-        enabled = bool(
-            data.get(
-                "enabled",
-                False
-            )
-        )
+        enabled = bool(data.get("enabled", False))
 
         with state_lock:
 
-            dashboard_state[
-                "system_armed"
-            ] = enabled
+            dashboard_state["system_armed"] = enabled
 
-        log(
-            "Security: "
-            +
-            (
-                "ARMED"
-                if enabled
-                else
-                "DISARMED"
+        log("Security: " + ("ARMED" if enabled else "DISARMED"))
+
+        # ----------------------------------------------------
+        # NOTIFY MCU TO UPDATE BUZZER STATE
+        # ----------------------------------------------------
+
+        try:
+
+            result = Bridge.call(
+                "set_system_armed",
+                enabled,
+                timeout=3
             )
-        )
+
+            log(f"MCU armed state updated: {result}")
+
+        except Exception as exc:
+
+            log(f"⚠️ MCU armed state error: {exc}")
 
         send_dashboard_state()
 
@@ -2387,18 +2148,11 @@ def handle_control(
 
     if action == "set_notifications":
 
-        enabled = bool(
-            data.get(
-                "enabled",
-                False
-            )
-        )
+        enabled = bool(data.get("enabled", False))
 
         with state_lock:
 
-            dashboard_state[
-                "notifications_enabled"
-            ] = enabled
+            dashboard_state["notifications_enabled"] = enabled
 
         send_dashboard_state()
 
@@ -2410,12 +2164,7 @@ def handle_control(
 
     if action == "set_led":
 
-        enabled = bool(
-            data.get(
-                "enabled",
-                False
-            )
-        )
+        enabled = bool(data.get("enabled", False))
 
         try:
 
@@ -2427,21 +2176,15 @@ def handle_control(
 
             with state_lock:
 
-                dashboard_state[
-                    "security_led"
-                ] = enabled
+                dashboard_state["security_led"] = enabled
 
-            log(
-                f"LED command result: {result}"
-            )
+            log(f"LED command result: {result}")
 
             send_dashboard_state()
 
         except Exception as exc:
 
-            log(
-                f"⚠️ LED Bridge error: {exc}"
-            )
+            log(f"⚠️ LED Bridge error: {exc}")
 
         return
 
@@ -2450,16 +2193,11 @@ def handle_control(
 # TELEGRAM COMMANDS
 # ============================================================
 
-def handle_command(
-    chat_id,
-    text
-):
+def handle_command(chat_id, text):
 
     text = text.lower().strip()
 
-    log(
-        f"Telegram command: {text}"
-    )
+    log(f"Telegram command: {text}")
 
     # --------------------------------------------------------
     # START
@@ -2469,9 +2207,7 @@ def handle_command(
 
         with state_lock:
 
-            dashboard_state[
-                "notifications_enabled"
-            ] = True
+            dashboard_state["notifications_enabled"] = True
 
         send_telegram_message(
 
@@ -2483,6 +2219,7 @@ def handle_command(
             "🌡 DHT11\n"
             "🚨 PIR Motion\n"
             "🚪 Door Sensor\n"
+            "🔔 Buzzer\n"
             "🤖 AI Face Detection\n"
             "👨‍👩‍👧 Family / Stranger\n\n"
 
@@ -2496,7 +2233,8 @@ def handle_command(
 
             "/motion\n"
             "/door\n"
-            "/status\n\n"
+            "/status\n"
+            "/buzzer\n\n"
 
             "/start\n"
             "/stop\n\n"
@@ -2515,9 +2253,7 @@ def handle_command(
 
         with state_lock:
 
-            dashboard_state[
-                "notifications_enabled"
-            ] = False
+            dashboard_state["notifications_enabled"] = False
 
         send_telegram_message(
 
@@ -2538,24 +2274,15 @@ def handle_command(
 
         with state_lock:
 
-            temp_c = dashboard_state[
-                "temperature"
-            ]
+            temp_c = dashboard_state["temperature"]
 
         if temp_c is None:
 
-            send_telegram_message(
-                chat_id,
-                "❌ DHT11 data unavailable."
-            )
+            send_telegram_message(chat_id, "❌ DHT11 data unavailable.")
 
             return
 
-        temp_f = (
-            temp_c *
-            9.0 /
-            5.0
-        ) + 32.0
+        temp_f = (temp_c * 9.0 / 5.0) + 32.0
 
         send_telegram_message(
 
@@ -2576,26 +2303,15 @@ def handle_command(
 
         with state_lock:
 
-            humidity = dashboard_state[
-                "humidity"
-            ]
+            humidity = dashboard_state["humidity"]
 
         if humidity is None:
 
-            send_telegram_message(
-                chat_id,
-                "❌ DHT11 data unavailable."
-            )
+            send_telegram_message(chat_id, "❌ DHT11 data unavailable.")
 
             return
 
-        send_telegram_message(
-
-            chat_id,
-
-            f"💧 Humidity: "
-            f"{humidity:.1f}%"
-        )
+        send_telegram_message(chat_id, f"💧 Humidity: {humidity:.1f}%")
 
         return
 
@@ -2607,42 +2323,21 @@ def handle_command(
 
         with state_lock:
 
-            temp_c = dashboard_state[
-                "temperature"
-            ]
+            temp_c = dashboard_state["temperature"]
 
-            humidity = dashboard_state[
-                "humidity"
-            ]
+            humidity = dashboard_state["humidity"]
 
-            heat_index = dashboard_state[
-                "heat_index"
-            ]
+            heat_index = dashboard_state["heat_index"]
 
-            trend = dashboard_state[
-                "trend"
-            ]
+            trend = dashboard_state["trend"]
 
-        if (
-            temp_c is None
-            or
-            humidity is None
-            or
-            heat_index is None
-        ):
+        if (temp_c is None or humidity is None or heat_index is None):
 
-            send_telegram_message(
-                chat_id,
-                "❌ DHT11 data unavailable."
-            )
+            send_telegram_message(chat_id, "❌ DHT11 data unavailable.")
 
             return
 
-        temp_f = (
-            temp_c *
-            9.0 /
-            5.0
-        ) + 32.0
+        temp_f = (temp_c * 9.0 / 5.0) + 32.0
 
         send_telegram_message(
 
@@ -2651,11 +2346,9 @@ def handle_command(
             "🔥 Heat Index:\n"
             f"{heat_index:.2f}°F\n\n"
 
-            f"Temperature: "
-            f"{temp_f:.2f}°F\n"
+            f"Temperature: {temp_f:.2f}°F\n"
 
-            f"Humidity: "
-            f"{humidity:.1f}%\n\n"
+            f"Humidity: {humidity:.1f}%\n\n"
 
             f"Trend: {trend}"
         )
@@ -2670,36 +2363,21 @@ def handle_command(
 
         with state_lock:
 
-            temp_c = dashboard_state[
-                "temperature"
-            ]
+            temp_c = dashboard_state["temperature"]
 
-            humidity = dashboard_state[
-                "humidity"
-            ]
+            humidity = dashboard_state["humidity"]
 
-            heat_index = dashboard_state[
-                "heat_index"
-            ]
+            heat_index = dashboard_state["heat_index"]
 
-            trend = dashboard_state[
-                "trend"
-            ]
+            trend = dashboard_state["trend"]
 
         if temp_c is None:
 
-            send_telegram_message(
-                chat_id,
-                "❌ DHT11 data unavailable."
-            )
+            send_telegram_message(chat_id, "❌ DHT11 data unavailable.")
 
             return
 
-        temp_f = (
-            temp_c *
-            9.0 /
-            5.0
-        ) + 32.0
+        temp_f = (temp_c * 9.0 / 5.0) + 32.0
 
         send_telegram_message(
 
@@ -2707,15 +2385,11 @@ def handle_command(
 
             "🌡 COMFORT STATUS\n\n"
 
-            f"Temperature: "
-            f"{temp_c:.2f}°C / "
-            f"{temp_f:.2f}°F\n\n"
+            f"Temperature: {temp_c:.2f}°C / {temp_f:.2f}°F\n\n"
 
-            f"Humidity: "
-            f"{humidity:.1f}%\n\n"
+            f"Humidity: {humidity:.1f}%\n\n"
 
-            f"🔥 Heat Index: "
-            f"{heat_index:.2f}°F\n\n"
+            f"🔥 Heat Index: {heat_index:.2f}°F\n\n"
 
             f"📈 Trend: {trend}"
         )
@@ -2730,22 +2404,14 @@ def handle_command(
 
         with state_lock:
 
-            active = dashboard_state[
-                "pir_active"
-            ]
+            active = dashboard_state["pir_active"]
 
         send_telegram_message(
 
             chat_id,
 
             "🚨 Motion Status\n\n"
-            +
-            (
-                "ACTIVE"
-                if active
-                else
-                "IDLE"
-            )
+            + ("ACTIVE" if active else "IDLE")
         )
 
         return
@@ -2758,23 +2424,44 @@ def handle_command(
 
         with state_lock:
 
-            is_open = dashboard_state[
-                "door_open"
-            ]
+            is_open = dashboard_state["door_open"]
 
         send_telegram_message(
 
             chat_id,
 
             "🚪 Door Status\n\n"
-            +
-            (
-                "OPEN"
-                if is_open
-                else
-                "CLOSED"
-            )
+            + ("OPEN" if is_open else "CLOSED")
         )
+
+        return
+
+    # --------------------------------------------------------
+    # BUZZER
+    # --------------------------------------------------------
+
+    if text == "/buzzer":
+
+        try:
+
+            result = Bridge.call("get_buzzer_state", timeout=3)
+
+            armed = Bridge.call("get_system_armed", timeout=3)
+
+            send_telegram_message(
+
+                chat_id,
+
+                "🔔 Buzzer Status\n\n"
+                f"State: {result}\n"
+                f"System: {armed}"
+            )
+
+        except Exception as exc:
+
+            log(f"Buzzer status error: {exc}")
+
+            send_telegram_message(chat_id, "❌ Unable to get buzzer status.")
 
         return
 
@@ -2786,66 +2473,40 @@ def handle_command(
 
         with state_lock:
 
-            temp_c = dashboard_state[
-                "temperature"
-            ]
+            temp_c = dashboard_state["temperature"]
 
-            humidity = dashboard_state[
-                "humidity"
-            ]
+            humidity = dashboard_state["humidity"]
 
-            heat_index = dashboard_state[
-                "heat_index"
-            ]
+            heat_index = dashboard_state["heat_index"]
 
-            trend = dashboard_state[
-                "trend"
-            ]
+            trend = dashboard_state["trend"]
 
-            motion = dashboard_state[
-                "pir_active"
-            ]
+            motion = dashboard_state["pir_active"]
 
-            door = dashboard_state[
-                "door_open"
-            ]
+            door = dashboard_state["door_open"]
 
-            armed = dashboard_state[
-                "system_armed"
-            ]
+            armed = dashboard_state["system_armed"]
 
-            notifications = dashboard_state[
-                "notifications_enabled"
-            ]
+            notifications = dashboard_state["notifications_enabled"]
 
         if temp_c is not None:
 
-            temp_f = (
-                temp_c *
-                9.0 /
-                5.0
-            ) + 32.0
+            temp_f = (temp_c * 9.0 / 5.0) + 32.0
 
             environment = (
 
-                f"Temperature: "
-                f"{temp_c:.2f}°C / "
-                f"{temp_f:.2f}°F\n"
+                f"Temperature: {temp_c:.2f}°C / {temp_f:.2f}°F\n"
 
-                f"Humidity: "
-                f"{humidity:.1f}%\n"
+                f"Humidity: {humidity:.1f}%\n"
 
-                f"Heat Index: "
-                f"{heat_index:.2f}°F\n"
+                f"Heat Index: {heat_index:.2f}°F\n"
 
                 f"Trend: {trend}"
             )
 
         else:
 
-            environment = (
-                "DHT11 unavailable"
-            )
+            environment = "DHT11 unavailable"
 
         status = (
 
@@ -2863,14 +2524,14 @@ def handle_command(
             "🛡 SECURITY\n"
             f"{'ARMED' if armed else 'DISARMED'}\n\n"
 
+            "🔔 Buzzer\n"
+            f"{'ARMED + DOOR OPEN = ALARM' if armed and door else 'OFF'}\n\n"
+
             "🔔 Notifications\n"
             f"{'ON' if notifications else 'OFF'}"
         )
 
-        send_telegram_message(
-            chat_id,
-            status
-        )
+        send_telegram_message(chat_id, status)
 
         return
 
@@ -2882,33 +2543,19 @@ def handle_command(
 
         try:
 
-            result = Bridge.call(
-                "set_led_command",
-                "ON",
-                timeout=3
-            )
+            result = Bridge.call("set_led_command", "ON", timeout=3)
 
             with state_lock:
 
-                dashboard_state[
-                    "security_led"
-                ] = True
+                dashboard_state["security_led"] = True
 
-            send_telegram_message(
-                chat_id,
-                f"💡 {result}"
-            )
+            send_telegram_message(chat_id, f"💡 {result}")
 
         except Exception as exc:
 
-            log(
-                f"LED command error: {exc}"
-            )
+            log(f"LED command error: {exc}")
 
-            send_telegram_message(
-                chat_id,
-                "❌ Unable to control LED."
-            )
+            send_telegram_message(chat_id, "❌ Unable to control LED.")
 
         return
 
@@ -2920,33 +2567,19 @@ def handle_command(
 
         try:
 
-            result = Bridge.call(
-                "set_led_command",
-                "OFF",
-                timeout=3
-            )
+            result = Bridge.call("set_led_command", "OFF", timeout=3)
 
             with state_lock:
 
-                dashboard_state[
-                    "security_led"
-                ] = False
+                dashboard_state["security_led"] = False
 
-            send_telegram_message(
-                chat_id,
-                f"💡 {result}"
-            )
+            send_telegram_message(chat_id, f"💡 {result}")
 
         except Exception as exc:
 
-            log(
-                f"LED command error: {exc}"
-            )
+            log(f"LED command error: {exc}")
 
-            send_telegram_message(
-                chat_id,
-                "❌ Unable to control LED."
-            )
+            send_telegram_message(chat_id, "❌ Unable to control LED.")
 
         return
 
@@ -2980,7 +2613,8 @@ def handle_command(
 
             "/motion\n"
             "/door\n"
-            "/status\n\n"
+            "/status\n"
+            "/buzzer\n\n"
 
             "/start\n"
             "/stop\n\n"
@@ -3021,41 +2655,26 @@ def clear_old_updates():
 
     try:
 
-        response = requests.get(
+        response = telegram_session.get(
 
-            telegram_url(
-                "getUpdates"
-            ),
+            telegram_url("getUpdates"),
 
-            params={
-                "offset": -1,
-                "timeout": 1
-            },
+            params={"offset": -1, "timeout": 1},
 
             timeout=10
         )
 
         data = response.json()
 
-        if (
-            data.get("ok")
-            and
-            data.get("result")
-        ):
+        if (data.get("ok") and data.get("result")):
 
-            last_update_id = (
-                data["result"][-1]["update_id"]
-            )
+            last_update_id = data["result"][-1]["update_id"]
 
-            log(
-                "Old Telegram updates cleared."
-            )
+            log("Old Telegram updates cleared.")
 
     except Exception as exc:
 
-        log(
-            f"Telegram queue clear error: {exc}"
-        )
+        log(f"Telegram queue clear error: {exc}")
 
 
 def get_updates():
@@ -3068,51 +2687,43 @@ def get_updates():
 
     try:
 
-        response = requests.get(
+        response = telegram_session.get(
 
-            telegram_url(
-                "getUpdates"
-            ),
+            telegram_url("getUpdates"),
 
             params={
-                "offset":
-                    last_update_id + 1,
-
-                "timeout":
-                    1
+                "offset": last_update_id + 1,
+                "timeout": 5,  # Long polling
+                "allowed_updates": ["message"]
             },
 
-            timeout=4
+            timeout=10  # HTTP timeout > long-poll timeout
         )
 
         data = response.json()
 
         if not data.get("ok"):
 
-            log(
-                f"Telegram update error: {data}"
-            )
+            log(f"Telegram update error: {data}")
 
             return []
 
-        updates = data.get(
-            "result",
-            []
-        )
+        updates = data.get("result", [])
 
         if updates:
 
-            last_update_id = (
-                updates[-1]["update_id"]
-            )
+            last_update_id = updates[-1]["update_id"]
 
         return updates
 
+    except requests.exceptions.Timeout:
+
+        # Expected with long polling
+        return []
+
     except Exception as exc:
 
-        log(
-            f"Telegram update error: {exc}"
-        )
+        log(f"Telegram update error: {exc}")
 
         return []
 
@@ -3129,103 +2740,55 @@ def process_telegram():
 
                 continue
 
-            message = update[
-                "message"
-            ]
+            message = update["message"]
 
-            chat_id = (
-                message[
-                    "chat"
-                ][
-                    "id"
-                ]
-            )
+            chat_id = message["chat"]["id"]
 
-            text = (
-                message.get(
-                    "text",
-                    ""
-                )
-                .strip()
-            )
+            text = message.get("text", "").strip()
 
             if not text:
 
                 continue
 
-            handle_command(
-                chat_id,
-                text
-            )
+            handle_command(chat_id, text)
 
         except Exception as exc:
 
-            log(
-                f"Telegram command error: {exc}"
-            )
+            log(f"Telegram command error: {exc}")
 
 
 # ============================================================
 # WEBUI
 # ============================================================
 
-log(
-    "Creating WebUI..."
-)
+log("Creating WebUI...")
 
 ui = WebUI()
 
-log(
-    "✅ WebUI created."
-)
+log("✅ WebUI created.")
 
-ui.on_message(
-    "control",
-    handle_control
-)
+ui.on_message("control", handle_control)
 
 
 # ============================================================
 # BRIDGE CALLBACKS
 # ============================================================
 
-log(
-    "Registering Bridge callbacks..."
-)
+log("Registering Bridge callbacks...")
 
-Bridge.provide(
-    "on_environment",
-    on_environment
-)
+Bridge.provide("on_environment", on_environment)
 
-Bridge.provide(
-    "on_pir",
-    on_pir
-)
+Bridge.provide("on_pir", on_pir)
 
-Bridge.provide(
-    "on_door",
-    on_door
-)
+Bridge.provide("on_door", on_door)
 
-Bridge.provide(
-    "record_sensor_samples",
-    record_sensor_samples
-)
+Bridge.provide("record_sensor_samples", record_sensor_samples)
 
-Bridge.provide(
-    "get_air_quality",
-    get_air_quality
-)
+Bridge.provide("get_air_quality", get_air_quality)
 
-Bridge.provide(
-    "get_weather_forecast",
-    get_weather_forecast
-)
+Bridge.provide("get_weather_forecast", get_weather_forecast)
 
-log(
-    "✅ Bridge callbacks registered."
-)
+log("✅ Bridge callbacks registered.")
 
 
 # ============================================================
@@ -3253,77 +2816,61 @@ ui.expose_api("GET", "/get_samples/{resource}/{start}/{aggr_window}", on_get_sam
 # CAMERA
 # ============================================================
 
-log(
-    "Initializing Camera..."
-)
+log("Initializing Camera...")
 
 camera = Camera(
-    resolution=(
-        CAMERA_WIDTH,
-        CAMERA_HEIGHT
-    )
+    resolution=(CAMERA_WIDTH, CAMERA_HEIGHT)
 )
 
 camera.start()
 
-log(
-    "✅ Camera initialized."
-)
+log("✅ Camera initialized.")
 
 
 # ============================================================
 # IMAGE CLASSIFICATION
 # ============================================================
 
-log(
-    "Initializing Image Classification..."
-)
+log("Initializing Image Classification...")
 
-image_classification = (
-    ImageClassification()
-)
+image_classification = ImageClassification()
 
-log(
-    "✅ Image Classification initialized."
-)
+log("✅ Image Classification initialized.")
 
 
 # ============================================================
 # FACE DETECTION
 # ============================================================
 
-log(
-    "Initializing Face Detection..."
+log("Initializing Face Detection...")
+
+detection_stream = VideoObjectDetection(
+    camera=camera,
+    confidence=FACE_CONFIDENCE,
+    debounce_sec=1.0
 )
 
-detection_stream = (
-    VideoObjectDetection(
-
-        camera=camera,
-
-        confidence=FACE_CONFIDENCE,
-
-        debounce_sec=1.0
-    )
-)
-
-log(
-    "✅ Face Detection initialized."
-)
+log("✅ Face Detection initialized.")
 
 
 # ============================================================
 # DETECTION CALLBACKS
 # ============================================================
 
-detection_stream.on_detect(
-    "face",
-    face_detected
-)
+detection_stream.on_detect("face", face_detected)
 
-detection_stream.on_detect_all(
-    receive_detection_data
-)
+detection_stream.on_detect_all(receive_detection_data)
+
+
+# ============================================================
+# INITIAL OUTDOOR DATA
+# ============================================================
+
+print("Getting initial outdoor environment...")
+
+get_air_quality()
+
+get_weather_forecast(CITY)
 
 
 # ============================================================
@@ -3331,98 +2878,47 @@ detection_stream.on_detect_all(
 # ============================================================
 
 log("")
-log(
-    "============================================================"
-)
-log(
-    "       UNIFIED UNO Q AI SECURITY DASHBOARD"
-)
-log(
-    "============================================================"
-)
+log("============================================================")
+log("       UNIFIED UNO Q AI SECURITY DASHBOARD")
+log("============================================================")
 
-log(
-    "DHT11          : D2"
-)
+log("DHT11          : D2")
+log("Motion LED     : D3")
+log("Door LED       : D4")
+log("BUZZER         : D5")
+log("PIR            : D8")
+log("Door Sensor    : D9")
+log("Camera         : USB")
+log("LED Matrix     : Q1/Q2 (Built-in)")
+log("Face Detection : ENABLED")
+log("Classification : FAMILY / STRANGER")
+log("Buzzer         : ENABLED (Armed + Door Open)")
+log("AQI            : ENABLED")
+log("Weather        : ENABLED")
+log("Heat Index     : ENABLED")
+log("Trend          : ENABLED")
+log("Hourly Report  : ENABLED")
+log("Telegram       : " + ("CONFIGURED" if telegram_configured() else "NOT CONFIGURED"))
+log("Bridge Mode    : MCU PUSH")
+log("============================================================")
+log("✅ ALL PYTHON COMPONENTS INITIALIZED")
+log("Waiting for sensor data and PIR motion...")
+log("============================================================")
 
-log(
-    "LED            : D3"
-)
 
-log(
-    "Door Sensor    : D4"
-)
+# ============================================================
+# SYNC ARMED STATE TO MCU ON STARTUP
+# ============================================================
 
-log(
-    "PIR            : D8"
-)
-
-log(
-    "Camera         : USB"
-)
-
-log(
-    "LED Matrix     : Q1/Q2 (Built-in)"
-)
-
-log(
-    "Face Detection : ENABLED"
-)
-
-log(
-    "Classification : FAMILY / STRANGER"
-)
-
-log(
-    "AQI            : ENABLED"
-)
-
-log(
-    "Weather        : ENABLED"
-)
-
-log(
-    "Heat Index     : ENABLED"
-)
-
-log(
-    "Trend          : ENABLED"
-)
-
-log(
-    "Hourly Report  : ENABLED"
-)
-
-log(
-    "Telegram       : "
-    +
-    (
-        "CONFIGURED"
-        if telegram_configured()
-        else
-        "NOT CONFIGURED"
+try:
+    Bridge.call(
+        "set_system_armed",
+        dashboard_state["system_armed"],
+        timeout=3
     )
-)
-
-log(
-    "Bridge Mode    : MCU PUSH"
-)
-
-log(
-    "============================================================"
-)
-
-log(
-    "✅ ALL PYTHON COMPONENTS INITIALIZED"
-)
-
-log(
-    "Waiting for sensor data and PIR motion..."
-)
-
-log(
-    "============================================================"
-)
+    log("✅ Initial armed state synced to MCU")
+except Exception as exc:
+    log(f"⚠️ Could not sync armed state to MCU: {exc}")
 
 
 # ============================================================
@@ -3445,6 +2941,7 @@ if telegram_configured():
         "📈 Comfort trend enabled\n"
         "🚨 PIR motion detection enabled\n"
         "🚪 Door sensor monitoring enabled\n"
+        "🔔 Buzzer alarm enabled (Armed + Door Open)\n"
         "🤖 AI face detection enabled\n"
         "👨‍👩‍👧 Family/Stranger recognition enabled\n"
         "🌫️ AQI monitoring enabled\n"
@@ -3469,13 +2966,9 @@ def main_loop():
 
     except Exception as exc:
 
-        log(
-            f"Main loop error: {exc}"
-        )
+        log(f"Main loop error: {exc}")
 
-    time.sleep(
-        0.10
-    )
+    time.sleep(0.05)  # Tiny yield for long polling efficiency
 
 
 # ============================================================
@@ -3484,23 +2977,15 @@ def main_loop():
 
 try:
 
-    log(
-        "🚀 Starting Arduino App..."
-    )
+    log("🚀 Starting Arduino App...")
 
-    App.run(
-        user_loop=main_loop
-    )
+    App.run(user_loop=main_loop)
 
 except Exception as exc:
 
-    log(
-        "❌ FATAL APPLICATION ERROR"
-    )
+    log("❌ FATAL APPLICATION ERROR")
 
-    log(
-        repr(exc)
-    )
+    log(repr(exc))
 
     raise
 
@@ -3510,9 +2995,19 @@ finally:
 
         camera.stop()
 
-        log(
-            "Camera stopped."
-        )
+        log("Camera stopped.")
+
+    except Exception:
+
+        pass
+
+    try:
+
+        telegram_sender_running = False
+
+        telegram_queue.put(None)
+
+        log("Telegram sender stopped.")
 
     except Exception:
 
