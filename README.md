@@ -1,1 +1,1 @@
-# -HomeMind
+# HomeMind
