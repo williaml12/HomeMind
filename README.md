@@ -4,6 +4,8 @@
 
 HomeMind unifies environmental sensing, motion/door security, AI-powered face recognition, outdoor air quality & weather monitoring, and Telegram notifications into a single, elegant dashboard — all running on the Arduino UNO Q's dual-brain (MCU + Linux) architecture.
 
+👉 Live Demo: https://williaml12.github.io/HomeMind/
+
 ---
 
 ## 📖 Overview
