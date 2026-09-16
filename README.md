@@ -7,6 +7,7 @@ HomeMind unifies environmental sensing, motion/door security, AI-powered face re
 👉 Live Demo: https://williaml12.github.io/HomeMind/
 
 ## Showcase the website
+### 8 Climate Metric Cards
 ![Home_page](./images/IMG_2448.jpeg)
 
 ![Interactive charts](./images/IMG_2449.jpeg)
