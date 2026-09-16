@@ -7,7 +7,7 @@ HomeMind unifies environmental sensing, motion/door security, AI-powered face re
 👉 Live Demo: https://williaml12.github.io/HomeMind/
 
 ## Showcase the website
-![Home_page](./images/Website_Preview_Updated.jpg)
+![Home_page](./images/IMG_2448.jpeg)
 ---
 
 ## 📖 Overview
