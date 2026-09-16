@@ -8,6 +8,8 @@ HomeMind unifies environmental sensing, motion/door security, AI-powered face re
 
 ## Showcase the website
 ![Home_page](./images/IMG_2448.jpeg)
+![Interactive charts](./images/IMG_2449.jpeg)
+![Event Feed](./images/IMG_2451.jpeg)
 ---
 
 ## 📖 Overview
