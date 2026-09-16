@@ -10,8 +10,10 @@ HomeMind unifies environmental sensing, motion/door security, AI-powered face re
 ### 8 Climate Metric Cards
 ![Home_page](./images/IMG_2448.jpeg)
 
+### Charts with tabs — Live / 1 Hour / 1 Day for all five climate metrics
 ![Interactive charts](./images/IMG_2449.jpeg)
 
+### Real-time security event feed with images, severity colors, and confidence
 ![Event Feed](./images/IMG_2451.jpeg)
 ---
 
