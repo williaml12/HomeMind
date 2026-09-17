@@ -32,7 +32,7 @@ HomeMind combines an **Arduino sketch** (running on the MCU) with a **Python app
 ---
 Find more about **🎙️ Local Edge AI Voice Assistant** include code and setup the bricks:
 
-Local Edge AI Voice Assistant (Kokoro TTS Edition): https://github.com/williaml12/Local-Edge-AI-Voice-Assistant
+Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.com/williaml12/Local-Edge-AI-Voice-Assistant
 
 ---
 
