@@ -30,7 +30,7 @@ HomeMind combines an **Arduino sketch** (running on the MCU) with a **Python app
 - 📊 Provides a **real-time web dashboard** with charts, live camera feed, and security event log
 
 ---
-Find more about **🎙️ Local Edge AI Voice Assistant** include code and setup for the bricks:
+Find more information about **🎙️ Local Edge AI Voice Assistant** include code and setup for the bricks:
 
 Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.com/williaml12/Local-Edge-AI-Voice-Assistant
 
