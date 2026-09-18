@@ -177,7 +177,7 @@ In `python/main.py`, replace the placeholders:
 BOT_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID   = "YOUR_CHAT_ID"
 API_TOKEN = "demo"  # Replace with your WAQI token
-CITY      = "Brooklyn"  # Change to your city
+CITY      = "Turin"  # Change to your city
 ```
 
 ### 3. Install Python Dependencies
