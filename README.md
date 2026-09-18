@@ -99,6 +99,11 @@ Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.c
 | USB Webcam | — | For AI face detection |
 
 ---
+## 💻 Software
+- Arduino App Lab
+- Edge Impulse Studio
+
+---
 
 ## 🏗️ Architecture
 
