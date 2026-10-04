@@ -87,7 +87,7 @@ Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.c
 
 ## 🧰 Hardware Requirements
 
-| Component | Pin | Notes |
+| Component | Pin and Connection| Notes |
 |-----------|-----|-------|
 | DHT11 Sensor | D2 | Temperature + Humidity |
 | Motion LED | D3 | Motion indicator |
@@ -98,7 +98,7 @@ Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.c
 | LED Matrix | Q1/Q2 | Built-in on UNO Q |
 | USB Webcam | — | For AI face detection |
 | USB Hub| Connect webcam and other peripherals | USB |
-| Display| Display the dashboard| USB Hub(HTMI) |
+| Display| USB Hub(HTMI) | Display the dashboard |
 ---
 ## 💻 Software
 - Arduino App Lab
