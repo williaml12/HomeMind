@@ -97,6 +97,7 @@ Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.c
 | Door Sensor | D9 | `INPUT_PULLUP` (HIGH = OPEN) |
 | LED Matrix | Q1/Q2 | Built-in on UNO Q |
 | USB Webcam | — | For AI face detection |
+| USB Hub| Connect webcam and other peripherals | USB           |
 
 ---
 ## 💻 Software
