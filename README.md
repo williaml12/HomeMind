@@ -96,9 +96,10 @@ Local Edge AI Voice Assistant (Kokoro TTS & ASR local Edition): https://github.c
 | PIR Motion Sensor | D8 | Digital input |
 | Door Sensor | D9 | `INPUT_PULLUP` (HIGH = OPEN) |
 | LED Matrix | Q1/Q2 | Built-in on UNO Q |
-| USB Webcam | USB port | For AI face detection |
-| USB Hub| Connect webcam and other peripherals | USB |
+| USB Webcam | USB port (Connected to USB-A) | For AI face detection |
+| USB Hub| Connected to UNO Q | Connect webcam and other peripherals |
 | Display| USB Hub(HTMI) | Display the dashboard |
+| Keyboard and Mouse| Connected to USB-A | Use UNO Q as a standalone Single-Board computer |
 ---
 ## 💻 Software
 - Arduino App Lab
